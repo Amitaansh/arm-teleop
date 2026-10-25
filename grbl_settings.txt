@@ -1,0 +1,35 @@
+; GRBL settings for the arm teleop (grbl-Mega-5X, 4 axes: X front pair, Y rear, Z piston, A bogie)
+; Apply with:  python3 setup_grbl.py        Everything after ';' is a comment.
+;
+; Drives: STEPPERONLINE ESS23-10 (rails, piston), ESS17-07 (bogie), DIP set to 1000 pulses/rev
+;   (SW2 SW3 SW4 = ON, SW5 = OFF). Speeds start low on purpose; raise after bring-up.
+
+$0=10        ; step pulse length, us
+$1=255       ; step idle delay (no enable line wired, so irrelevant)
+$2=0         ; step pulse invert mask. Try 1/2/4/8 per axis if an axis counts double or misses
+$3=0         ; direction invert mask (X=1 Y=2 Z=4 A=8). Prefer the drive's DIP SW1 for flips
+$4=0         ; enable invert (unused)
+$5=0         ; limit pins invert (unused)
+$6=0         ; probe invert (unused)
+$10=3        ; status report: MPos + buffer state (teleop needs this)
+$11=0.010    ; junction deviation, mm
+$12=0.002    ; arc tolerance, mm
+$13=0        ; report in mm
+$20=0        ; soft limits OFF (need homing; limits are enforced on the Jetson instead)
+$21=0        ; hard limits OFF (no switches)
+$22=0        ; homing OFF
+
+$100=500     ; X front pair: 1000 ppr / 2 mm lead
+$101=500     ; Y rear:       1000 ppr / 2 mm lead
+$102=100     ; Z piston:     PLACEHOLDER, set to 1000 / (mm per motor rev)
+$103=40      ; A bogie:      1000 ppr / 25 mm per motor rev (3:1 onto 15T AT5)
+
+$110=1200    ; X max rate, mm/min (20 mm/s; screw whip limit is ~36 mm/s)
+$111=1200    ; Y
+$112=2400    ; Z (40 mm/s, placeholder)
+$113=6000    ; A (100 mm/s; belt can do ~250)
+
+$120=100     ; X accel, mm/s^2
+$121=100     ; Y
+$122=200     ; Z
+$123=500     ; A
