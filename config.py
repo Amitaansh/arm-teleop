@@ -35,6 +35,29 @@ PITCH_MIN_DEG, PITCH_MAX_DEG = -35.0, 40.0
 PITCH_DZ = (BARREL_SPAN * math.sin(math.radians(PITCH_MIN_DEG)),
             BARREL_SPAN * math.sin(math.radians(PITCH_MAX_DEG)))
 
+# ---- Drive alarms (ALM) and motor free (MF)
+# ALM+ of all five drives joined -> A9 (GRBL reset/abort input, 4.7k pull-up to 5 V), ALM- -> GND.
+# MF+ of each drive -> its axis's GRBL enable pin (X D38, Y A2, Z A8, A D24), MF- -> GND.
+ALM_CONDUCTS_ON_FAULT = True   # the ALM output switches on (pulls A9 low) when a drive faults.
+                               # If the status line shows DRIVE ALM while every drive LED is
+                               # green, the output works the other way round: set False.
+AUTO_RESET = True              # reset the drives by themselves after a stall / drive alarm
+AUTO_RESET_MAX = 3             # at most this many auto resets per AUTO_RESET_WINDOW_S;
+AUTO_RESET_WINDOW_S = 60.0     # after that, something is jammed: wait for C
+DRIVE_FREE_S = (0.3, 1.0)      # how long MF frees the motors, one entry per reset attempt
+DRIVE_SETTLE_S = 0.3           # wait after re-energising before checking ALM again
+WAKE_AXIS = BOGIE              # GRBL only re-energises the motors when it starts a move, so a
+WAKE_MM = 0.05                 # reset ends with a tiny out-and-back jog on this axis (mm)
+
+# Optional fallback: a relay that cuts the drives' 24-48 V, switched from a GRBL output.
+# The ESS manual lists stall (Err5) and over-current (Err1) as "power down reset". If freeing
+# the motor with MF does not clear the red LED, wire a relay to GRBL's coolant pin (check
+# cpu_map.h for the pin) so M8 cuts drive power, and set POWER_CYCLE_OFF_CMD = "M8".
+POWER_CYCLE_OFF_CMD = None     # None = no relay fitted
+POWER_CYCLE_ON_CMD = "M9"
+POWER_CYCLE_OFF_S = 1.0        # power off this long
+POWER_CYCLE_BOOT_S = 1.5       # then wait this long for the drives to boot
+
 # ---- Speeds
 # Per-axis speed at gear 3 (mm/s). Keep these at or below GRBL's $110-$113 (which are mm/min).
 VMAX = (20.0, 20.0, 40.0, 100.0)
@@ -74,6 +97,7 @@ COMMAND_KEYS = {
     "KEY_3": "gear3",
     "KEY_SPACE": "stop",             # stop; motion stays off until all motion keys are released
     "KEY_Z": "zero",                 # hold ZERO_HOLD_S at the zero pose
-    "KEY_C": "clear_alarm",          # $X unlock after a GRBL alarm (also drops the zero)
+    "KEY_C": "clear_alarm",          # reset the drives (MF) + clear GRBL's alarm; drops the zero
     "KEY_ESC": "quit",
+    "KEY_F12": "sim_fault",          # --sim only: simulate a drive stall
 }

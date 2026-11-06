@@ -5,10 +5,12 @@
 ;   (SW2 SW3 SW4 = ON, SW5 = OFF). Speeds start low on purpose; raise after bring-up.
 
 $0=10        ; step pulse length, us
-$1=255       ; step idle delay (no enable line wired, so irrelevant)
+$1=255       ; step idle delay: 255 = keep the motors energised while idle. MUST stay 255:
+             ; any other value frees every motor (MF) each time motion stops
 $2=0         ; step pulse invert mask. Try 1/2/4/8 per axis if an axis counts double or misses
 $3=0         ; direction invert mask (X=1 Y=2 Z=4 A=8). Prefer the drive's DIP SW1 for flips
-$4=0         ; enable invert (unused)
+$4=0         ; enable invert. Enable pins drive MF+: HIGH = motor free, LOW = energised.
+             ; 0 = GRBL holds them LOW while running. If motors go limp at startup, set 1
 $5=0         ; limit pins invert (unused)
 $6=0         ; probe invert (unused)
 $10=3        ; status report: MPos + buffer state (teleop needs this)

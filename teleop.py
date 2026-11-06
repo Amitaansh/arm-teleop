@@ -5,20 +5,28 @@
     python3 teleop.py --sim      # no hardware: simulated motion, same keys and limits
 
 Keys (see config.py):  arrows height | I/K pitch | W/S front | E/D rear | U/O piston
-                       J/L bogie | 1/2/3 gear | Space stop | hold Z zero | C clear alarm | Esc quit
+                       J/L bogie | 1/2/3 gear | Space stop | hold Z zero | C reset drives | Esc quit
+                       (--sim only: F12 simulates a drive stall)
 
 How motion works: while motion keys are held, short jog increments (JOG_DT of motion each)
 are streamed to GRBL, with at most MAX_QUEUED_BLOCKS queued. When the held-key set changes
 (including release), a jog cancel is sent: GRBL decelerates and flushes, and once it reports
 Idle the new motion (if any) starts. Every increment is clipped against travel and pitch
 limits relative to the zero pose.
+
+Drive alarms: a stalled drive's ALM output hits GRBL's abort input, which stops all motion.
+The controller then resets the drives by itself (MF frees the motors briefly, which clears
+the drive, then they are energised again), drops the zero and waits for every motion key
+to be released. C does the same reset by hand.
 """
 from __future__ import annotations
 
 import argparse
 import math
+import shutil
 import signal
 import sys
+import threading
 import time
 
 import config as C
@@ -28,15 +36,39 @@ N = 4
 ZERO_VEC = (0, 0, 0, 0)
 
 
+def recover_drives(link, log=print):
+    """Reset the drives: MF attempts from config, then the optional power-cycle relay.
+
+    Blocks for one to a few seconds. Returns (ok, message).
+    """
+    ok, msg = False, "no reset attempted"
+    for free_s in C.DRIVE_FREE_S:
+        ok, msg = link.reset_drives(free_s, C.WAKE_AXIS, C.WAKE_MM, C.DRIVE_SETTLE_S)
+        if ok:
+            return ok, msg
+        log(f"drive reset with MF held {free_s:g} s failed: {msg}")
+    if C.POWER_CYCLE_OFF_CMD:
+        log("power-cycling the drives through the relay")
+        ok, msg = link.power_cycle_drives(C.POWER_CYCLE_OFF_CMD, C.POWER_CYCLE_ON_CMD,
+                                          C.POWER_CYCLE_OFF_S, C.POWER_CYCLE_BOOT_S,
+                                          C.WAKE_AXIS, C.WAKE_MM, C.DRIVE_SETTLE_S)
+    return ok, msg
+
+
 class Controller:
-    """All teleop logic. No I/O of its own: fed with key events/held keys, talks to a link."""
+    """All teleop logic. No I/O of its own: fed with key events/held keys, talks to a link.
+
+    Modes: IDLE -> JOG -> CANCEL -> IDLE for motion. Any drive alarm or GRBL alarm goes to
+    RESET (drives being reset in a worker thread), then IDLE, or FAULT if the reset failed
+    or auto reset is used up. FAULT waits for C.
+    """
 
     def __init__(self, link, log=print):
         self.link = link
         self.log = log
         self.gear = C.DEFAULT_GEAR
         self.zero = None                  # MPos at the zero pose, or None
-        self.mode = "IDLE"                # IDLE -> JOG -> CANCEL -> IDLE
+        self.mode = "IDLE"
         self.vec = ZERO_VEC
         self.target = None                # relative position where queued motion ends
         self.next_send = 0.0
@@ -48,6 +80,10 @@ class Controller:
         self.z_down_t = None
         self.reset_seen = link.reset_count
         self.error_seen = link.error_count
+        self.fault_msg = ""
+        self._auto_resets = []            # times of recent automatic resets
+        self._worker = None
+        self._result = None               # (ok, msg) from the reset worker
 
     # ------------------------------------------------------------- helpers
     @property
@@ -80,6 +116,16 @@ class Controller:
             self.zero = None
             self.log(f"ZERO LOST ({why}): limits off, fine gear only. Re-zero with Z.")
 
+    def fault_reason(self, st):
+        if st.drive_alarm:
+            return "drive alarm (ALM): a drive stalled or faulted"
+        if st.state.startswith("Alarm"):
+            alarm = getattr(self.link, "last_alarm", None)
+            return f"GRBL alarm ({alarm[1]})" if alarm else "GRBL alarm"
+        if st.state.startswith("Sleep"):
+            return "GRBL asleep (motors free)"
+        return None
+
     # ------------------------------------------------------------- events
     def on_event(self, kind: str, key: str, now: float):
         if kind == "disconnected":
@@ -106,28 +152,103 @@ class Controller:
         elif cmd == "zero":
             self.z_down_t = now
         elif cmd == "clear_alarm":
-            st = self.link.status
-            if st.state.startswith("Alarm"):
-                self.link.unlock()
-                self.drop_zero("alarm cleared")
-                self.log("alarm cleared ($X)")
+            if self.mode == "RESET":
+                self.log("drive reset already running")
+            else:
+                self._auto_resets = []
+                self.stop_latch = True
+                self.drop_zero("drive reset")
+                self._start_reset("C pressed")
+        elif cmd == "sim_fault":
+            inject = getattr(self.link, "inject_fault", None)
+            if inject:
+                inject()
+            else:
+                self.log("F12 stall simulation only works with --sim")
+
+    # ------------------------------------------------------------- drive reset
+    def _start_reset(self, why: str):
+        self.mode = "RESET"
+        self._result = None
+        self.log(f"resetting drives ({why}); motors go limp for a moment")
+        self._worker = threading.Thread(target=self._reset_worker, daemon=True)
+        self._worker.start()
+
+    def _reset_worker(self):
+        try:
+            self._result = recover_drives(self.link, self.log)
+        except Exception as e:                   # never leave the controller stuck in RESET
+            self._result = (False, f"reset error: {e}")
+
+    def _poll_reset(self):
+        if self._result is None:
+            return
+        ok, msg = self._result
+        self._result, self._worker = None, None
+        self.reset_seen = self.link.reset_count  # the reset's own GRBL resets/errors are expected
+        self.error_seen = self.link.error_count
+        self.limit_hits = set()
+        if ok:
+            self.mode = "IDLE"
+            self.fault_msg = ""
+            self.log(f"drives reset OK ({msg}). Release all keys to move again.")
+        else:
+            self.mode = "FAULT"
+            self.fault_msg = msg
+            self.log(f"DRIVE RESET FAILED: {msg}. If a drive LED is still red: cut drive power "
+                     "(E-stop), restore it, then press C.")
+
+    def _on_fault(self, why: str, now: float):
+        self.log(f"FAULT: {why}")
+        self.drop_zero("fault")
+        self.stop_latch = True                   # no motion until every motion key is released
+        self.z_down_t = None
+        self.limit_hits = set()
+        self.fault_msg = why
+        self._auto_resets = [t for t in self._auto_resets if now - t < C.AUTO_RESET_WINDOW_S]
+        if not C.AUTO_RESET:
+            self.mode = "FAULT"
+            self.log("auto reset is off: press C to reset the drives")
+        elif len(self._auto_resets) >= C.AUTO_RESET_MAX:
+            self.mode = "FAULT"
+            self.log(f"{len(self._auto_resets)} auto resets in {C.AUTO_RESET_WINDOW_S:.0f} s: "
+                     "check for a jam or overload, then press C")
+        else:
+            self._auto_resets.append(now)
+            self._start_reset("auto")
+
+    def wait_reset(self, timeout: float):
+        """Let a running drive reset finish (so we never quit with the motors left free)."""
+        w = self._worker
+        if w is not None:
+            w.join(timeout)
 
     # ------------------------------------------------------------- main step
     def update(self, held, now: float):
         link, st = self.link, self.link.status
 
-        if link.reset_count != self.reset_seen:          # Mega reset: MPos restarted at 0
+        if self.mode == "RESET":
+            self._poll_reset()
+            return
+
+        if link.reset_count != self.reset_seen:          # Mega reset: zero is no longer trusted
             self.reset_seen = link.reset_count
             self.drop_zero("GRBL reset")
-            self.mode = "IDLE"
-        if st.state.startswith("Alarm"):
-            self.drop_zero("GRBL alarm")
-            self.mode = "IDLE"
+            self.stop_latch = True                       # GRBL dropped the jog: release keys first
+            if self.mode != "FAULT":
+                self.mode = "IDLE"
         if link.error_count != self.error_seen:          # a jog line was rejected
             self.error_seen = link.error_count
             self.log(f"GRBL rejected {link.last_error[0]!r}: {link.last_error[1]}")
             if self.mode == "JOG":
                 self._cancel(now)
+
+        if self.mode == "FAULT":                         # wait for C
+            return
+        why = self.fault_reason(st)
+        if why:
+            self._on_fault(why, now)
+            return
 
         # zero: hold Z, only while stopped
         if self.z_down_t is not None and now - self.z_down_t >= C.ZERO_HOLD_S:
@@ -198,9 +319,12 @@ class Controller:
             tag = f"pitch {pitch_deg(p[C.FRONT], p[C.REAR]):+6.1f}deg"
         else:
             tag = "UNZEROED: limits OFF, fine only, hold Z at zero pose"
+        alm = " | DRIVE ALM" if st.drive_alarm else ""
+        fault = " | FAULT: press C" if self.mode == "FAULT" else ""
         lim = f" | LIMIT {','.join(sorted(self.limit_hits))}" if self.limit_hits else ""
         stop = " | STOP (release keys)" if self.stop_latch else ""
-        return f"[{self.mode:6}] gear {self.active_gear()} | {st.state:7} | {pos} | {tag}{lim}{stop}"
+        return (f"[{self.mode:6}] gear {self.active_gear()} | {st.state:7} | {pos} | "
+                f"{tag}{alm}{fault}{lim}{stop}")
 
 
 # ----------------------------------------------------------------- runner
@@ -224,7 +348,8 @@ def main():
     else:
         from grbl_link import GrblLink
         log(f"connecting to GRBL on {args.port} (the Mega resets on connect)...")
-        link = GrblLink(args.port, args.baud, C.STATUS_HZ, letters=C.AXIS_LETTERS, log=log)
+        link = GrblLink(args.port, args.baud, C.STATUS_HZ, letters=C.AXIS_LETTERS, log=log,
+                        alm_conducts_on_fault=C.ALM_CONDUCTS_ON_FAULT)
 
     kb = Keyboard(args.keyboard, grab=not args.no_grab, log=log)
     ctl = Controller(link, log=log)
@@ -248,14 +373,18 @@ def main():
             ctl.update(kb.held_keys() if kb.connected else frozenset(), now)
             if now >= next_disp:
                 next_disp = now + 1.0 / C.DISPLAY_HZ
-                sys.stdout.write("\r\033[K" + ctl.status_line())
+                width = shutil.get_terminal_size().columns - 1    # a wrapped line can't be redrawn in place
+                sys.stdout.write("\r\033[K" + ctl.status_line()[:width])
                 sys.stdout.flush()
             time.sleep(period)
     finally:
         try:
+            if ctl.mode == "RESET":
+                log("waiting for the drive reset to finish...")
+                ctl.wait_reset(8.0)
             link.jog_cancel()
             t0 = time.monotonic()
-            while link.status.state not in ("Idle", "Alarm") and time.monotonic() - t0 < 2.0:
+            while link.status.state not in ("Idle", "Alarm", "Sleep") and time.monotonic() - t0 < 2.0:
                 time.sleep(0.05)
         except Exception:
             pass
