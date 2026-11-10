@@ -6,6 +6,8 @@ If the keyboard is unplugged, all keys count as released and it reconnects when 
 """
 from __future__ import annotations
 
+import glob
+import os
 import queue
 import select
 import threading
@@ -45,7 +47,10 @@ class Keyboard:
     def _find(self):
         if self.path:
             return evdev.InputDevice(self.path)
-        for p in evdev.list_devices():
+        found = evdev.list_devices()          # only lists the devices we are allowed to read
+        if not found and any(os.access(p, os.F_OK) for p in glob.glob("/dev/input/event*")):
+            raise PermissionError("/dev/input/event* exist but none is readable")
+        for p in found:
             try:
                 d = evdev.InputDevice(p)
             except OSError:
@@ -70,14 +75,16 @@ class Keyboard:
                 dev = self._find()
             except PermissionError:
                 if not warned:
-                    self.log("keyboard: permission denied on /dev/input. "
-                             "Run: sudo usermod -aG input $USER, then log out and back in")
+                    self.log("keyboard: no permission to read /dev/input (not in the 'input' "
+                             "group). Run: sudo usermod -aG input $USER, then log out and in. "
+                             "Remote input still works.")
                     warned = True
                 time.sleep(1.0)
                 continue
             if dev is None:
                 if not warned:
-                    self.log("keyboard: no keyboard found, waiting...")
+                    self.log("keyboard: none plugged into this computer, waiting "
+                             "(remote input still works)")
                     warned = True
                 time.sleep(1.0)
                 continue

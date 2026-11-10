@@ -4,6 +4,9 @@ Swapping GRBL for custom firmware later means rewriting this file behind the sam
 interface: status, planner_total, reset_count, failed, jog(), jog_cancel(), unlock(),
 reset_drives(), power_cycle_drives(), close().
 
+Axes are always in teleop's own order (letters=...). GRBL reports MPos in its own axis
+order (X Y Z A B for grbl-Mega-5X with N_AXIS 5); this file maps between the two.
+
 Protocol notes (GRBL 1.1):
 - Lines get 'ok' or 'error:N'. Character-counting flow control: unacknowledged bytes
   must never exceed GRBL's 128-byte RX buffer.
@@ -78,9 +81,17 @@ class _Pending:
 
 class GrblLink:
     def __init__(self, port: str, baud: int = 115200, status_hz: float = 20.0,
-                 letters=("X", "Y", "Z", "A"), log=print, alm_conducts_on_fault: bool = True):
+                 letters=("X", "Y", "Z", "A"), log=print, alm_conducts_on_fault: bool = True,
+                 grbl_order: str = "XYZABC"):
+        """letters: GRBL letter of each of our axes, in our axis order (e.g. X B Y Z A).
+        grbl_order: the order GRBL itself reports MPos in (its axis 1, 2, 3, ...)."""
         self.letters = tuple(letters)
         self.n_axes = len(self.letters)
+        missing = [L for L in self.letters if L not in grbl_order]
+        if missing:
+            raise GrblError(f"axis letters {missing} not in GRBL axis order {grbl_order!r}")
+        self._mpos_index = [grbl_order.index(L) for L in self.letters]
+        self._short_mpos_warned = False
         self.log = log
         self.alm_conducts_on_fault = alm_conducts_on_fault
         self.status = Status(mpos=(0.0,) * self.n_axes)
@@ -233,8 +244,14 @@ class GrblLink:
             key, _, val = f.partition(":")
             if key == "MPos":
                 vals = [float(x) for x in val.split(",")]
-                vals += [0.0] * (self.n_axes - len(vals))
-                mpos = tuple(vals[: self.n_axes])
+                need = max(self._mpos_index) + 1
+                if len(vals) < need:
+                    if not self._short_mpos_warned:
+                        self._short_mpos_warned = True
+                        self.log(f"GRBL reports {len(vals)} axes but teleop needs {need} "
+                                 f"({''.join(self.letters)}): rebuild grbl-Mega-5X with N_AXIS {need}")
+                    vals += [0.0] * (need - len(vals))
+                mpos = tuple(vals[k] for k in self._mpos_index)
             elif key == "Bf":
                 a, _, b = val.partition(",")
                 pf, rf = int(a), int(b)

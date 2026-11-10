@@ -45,7 +45,7 @@ def main():
     ap.add_argument("--show", action="store_true")
     args = ap.parse_args()
 
-    link = GrblLink(args.port, args.baud, letters=C.AXIS_LETTERS)
+    link = GrblLink(args.port, args.baud, letters=C.AXIS_LETTERS, grbl_order=C.GRBL_AXIS_ORDER)
     try:
         info, _ = link.query("$I")
         print("build info:", *info, sep="\n  ")
@@ -64,8 +64,8 @@ def main():
         bad = [k for k, v in wanted.items() if k not in cur or abs(float(cur[k]) - float(v)) > 1e-6]
         if bad:
             print("\nMISMATCH:", ", ".join(f"{k} want {wanted[k]} got {cur.get(k, 'missing')}" for k in bad))
-            if any(k in ("$103", "$113", "$123") and k not in cur for k in bad):
-                print("4th-axis settings missing: the firmware was not built with 4 axes.")
+            if any(k in ("$104", "$114", "$124") and k not in cur for k in bad):
+                print("5th-axis (B) settings missing: the firmware was not built with N_AXIS 5.")
         else:
             print("\nall settings verified.")
     finally:

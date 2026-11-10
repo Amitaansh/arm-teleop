@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arm teleop</title>
+<style>
+  :root { --bg:#16181c; --panel:#202329; --text:#e8e8e8; --dim:#9aa0a6; --ok:#7ee08a; --bad:#ff7b7b; --key:#2c3038; --held:#3d6fd9; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.4 system-ui, sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 12px 16px 24px; }
+  #banner { padding: 12px 14px; border-radius: 8px; font-weight: 600; font-size: 16px; background:#5a2a2a; cursor: pointer; }
+  #banner.live { background:#1f4d2b; }
+  #status { margin-top: 10px; padding: 10px 12px; background: var(--panel); border-radius: 8px;
+            font: 13px/1.5 ui-monospace, Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; margin-top:10px; align-items:center; }
+  .row label { color: var(--dim); }
+  input { background: var(--panel); color: var(--text); border: 1px solid #3a3f48; border-radius: 6px; padding: 5px 8px; }
+  #held { font-family: ui-monospace, Menlo, Consolas, monospace; }
+  .buttons button { background: var(--key); color: var(--text); border: 1px solid #3a3f48; border-radius: 8px;
+                    padding: 10px 14px; font-size: 14px; touch-action: none; user-select: none; }
+  .buttons button.down { background: var(--held); }
+  #stop { background:#7a2626 !important; font-weight: 700; }
+  h2 { font-size: 13px; color: var(--dim); text-transform: uppercase; letter-spacing: .06em; margin: 18px 0 6px; }
+  #help { display:grid; grid-template-columns: repeat(auto-fill, minmax(270px, 1fr)); gap: 4px 16px; }
+  #help div { display:flex; gap:10px; }
+  #help kbd { min-width: 86px; text-align:right; color:#fff; font: 13px ui-monospace, Menlo, Consolas, monospace; }
+  #help div.on kbd { color: #8fb3ff; }
+  #log { background: #0f1114; border-radius: 8px; padding: 8px 10px; min-height: 9em;
+         font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; color: var(--dim); white-space: pre-wrap; word-break: break-word; }
+  #pad { color: var(--dim); }
+</style>
+</head>
+<body>
+<main>
+  <div id="banner">Click here, then hold keys to drive the arm</div>
+  <div id="status">connecting...</div>
+  <div class="row">
+    <span>held: <span id="held">-</span></span>
+    <span id="pad">gamepad: none</span>
+  </div>
+  <div class="row">
+    <label>name <input id="name" size="12"></label>
+    <label id="tokenbox" hidden>token <input id="token" size="12" type="password"></label>
+  </div>
+  <div class="row buttons">
+    <button id="stop" data-key="KEY_SPACE">STOP</button>
+    <button data-key="KEY_1">gear 1</button>
+    <button data-key="KEY_2">gear 2</button>
+    <button data-key="KEY_3">gear 3</button>
+    <button data-key="KEY_C">reset drives (C)</button>
+    <button data-key="KEY_H">hold: home all</button>
+    <button data-key="KEY_F1">hold: home rails</button>
+    <button data-key="KEY_F2">hold: home piston</button>
+    <button data-key="KEY_F3">hold: home bogie</button>
+  </div>
+  <h2>Keys</h2>
+  <div id="help"></div>
+  <h2>Log</h2>
+  <div id="log"></div>
+</main>
+<script>
+"use strict";
+const CFG = /*CONFIG*/null;
+const KNOWN = new Set(CFG.keys);
+const ID = Math.random().toString(36).slice(2, 10);
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+};
+const $ = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+$("name").value = params.get("name") || store.get("name") || "browser";
+$("name").addEventListener("change", () => store.set("name", $("name").value));
+if (CFG.token_required) {
+  $("tokenbox").hidden = false;
+  $("token").value = params.get("token") || store.get("token") || "";
+  $("token").addEventListener("change", () => store.set("token", $("token").value));
+}
+
+const LABEL = { KEY_UP: "Up", KEY_DOWN: "Down", KEY_LEFT: "Left", KEY_RIGHT: "Right",
+                KEY_SPACE: "Space", KEY_ESC: "Esc" };
+const label = (k) => LABEL[k] || k.replace(/^KEY_/, "");
+function codeToKey(code) {
+  const arrows = { ArrowUp: "KEY_UP", ArrowDown: "KEY_DOWN", ArrowLeft: "KEY_LEFT", ArrowRight: "KEY_RIGHT",
+                   Space: "KEY_SPACE", Escape: "KEY_ESC" };
+  if (arrows[code]) return arrows[code];
+  let m;
+  if ((m = /^Key([A-Z])$/.exec(code))) return "KEY_" + m[1];
+  if ((m = /^(?:Digit|Numpad)([0-9])$/.exec(code))) return "KEY_" + m[1];
+  if ((m = /^F([0-9]{1,2})$/.exec(code))) return "KEY_F" + m[1];
+  return null;
+}
+
+// key menu
+const helpRows = [];
+for (const [keys, text] of CFG.help) {
+  if (keys.every((k) => !KNOWN.has(k))) continue;          // e.g. Esc: Jetson keyboard only
+  const div = document.createElement("div");
+  const kbd = document.createElement("kbd");
+  kbd.textContent = keys.map(label).join("/");
+  const span = document.createElement("span");
+  span.textContent = text;
+  div.append(kbd, span);
+  $("help").append(div);
+  helpRows.push([keys, div]);
+}
+
+// held keys from the keyboard, the on-screen buttons and the gamepad
+const kbHeld = new Set();
+const btnHeld = new Set();
+let focused = document.hasFocus();
+
+function releaseAll() { kbHeld.clear(); btnHeld.clear();
+  document.querySelectorAll(".buttons button.down").forEach((b) => b.classList.remove("down")); }
+
+window.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT") return;
+  const k = codeToKey(e.code);
+  if (k === "KEY_ESC") { releaseAll(); e.preventDefault(); return; }
+  if (k && KNOWN.has(k)) { kbHeld.add(k); e.preventDefault(); }
+});
+window.addEventListener("keyup", (e) => {
+  const k = codeToKey(e.code);
+  if (k) { kbHeld.delete(k); if (KNOWN.has(k)) e.preventDefault(); }
+});
+window.addEventListener("blur", () => { focused = false; releaseAll(); });
+window.addEventListener("focus", () => { focused = true; });
+document.addEventListener("visibilitychange", () => { if (document.hidden) releaseAll(); });
+$("banner").addEventListener("click", () => window.focus());
+
+document.querySelectorAll(".buttons button").forEach((b) => {
+  const k = b.dataset.key;
+  const down = (e) => { e.preventDefault(); b.setPointerCapture && b.setPointerCapture(e.pointerId);
+                        btnHeld.add(k); b.classList.add("down"); };
+  const up = () => { btnHeld.delete(k); b.classList.remove("down"); };
+  b.addEventListener("pointerdown", down);
+  b.addEventListener("pointerup", up);
+  b.addEventListener("pointercancel", up);
+  b.addEventListener("lostpointercapture", up);
+});
+
+function gamepadKeys() {
+  const out = new Set();
+  const blocked = "gamepad: blocked here (browsers allow it on http://localhost or https only; see README)";
+  if (!navigator.getGamepads || !window.isSecureContext) { $("pad").textContent = blocked; return out; }
+  let pads = [];
+  try { pads = Array.from(navigator.getGamepads()).filter(Boolean); }
+  catch (e) { $("pad").textContent = blocked; return out; }
+  if (!pads.length) { $("pad").textContent = "gamepad: none (press a button on it)"; return out; }
+  const gp = pads[0];
+  $("pad").textContent = "gamepad: " + gp.id.slice(0, 40);
+  const dz = CFG.gamepad.deadzone;
+  for (const [ax, pair] of Object.entries(CFG.gamepad.axes)) {
+    const v = gp.axes[+ax] || 0;
+    if (v <= -dz && pair[0]) out.add(pair[0]);
+    if (v >= dz && pair[1]) out.add(pair[1]);
+  }
+  for (const [b, k] of Object.entries(CFG.gamepad.buttons)) {
+    const btn = gp.buttons[+b];
+    if (btn && (btn.pressed || btn.value > 0.5)) out.add(k);
+  }
+  return out;
+}
+
+let lastOk = 0;
+async function loop() {
+  const held = new Set([...kbHeld, ...btnHeld, ...gamepadKeys()].filter((k) => KNOWN.has(k)));
+  const body = { id: ID, name: $("name").value || "browser", held: [...held].sort() };
+  if (CFG.token_required) body.token = $("token").value;
+  try {
+    const r = await fetch("held", { method: "POST", headers: { "Content-Type": "application/json" },
+                                    body: JSON.stringify(body), cache: "no-store" });
+    if (r.status === 403) { $("status").textContent = "WRONG TOKEN"; }
+    else if (r.ok) {
+      lastOk = performance.now();
+      const msg = await r.json();
+      if (msg.status !== undefined) $("status").textContent = msg.status;
+      if (msg.log) $("log").textContent = msg.log.join("\n");
+    }
+  } catch (e) { /* shown by the banner below */ }
+  const live = performance.now() - lastOk < 1000;
+  const b = $("banner");
+  b.classList.toggle("live", live && focused);
+  b.textContent = !live ? "NO CONNECTION to teleop.py (is it running? right address?)"
+                : focused ? "Keys go to the arm. Click elsewhere or press Esc to release everything."
+                : "Click here, then hold keys to drive the arm";
+  $("held").textContent = held.size ? [...held].map(label).join(" ") : "-";
+  for (const [keys, div] of helpRows) div.classList.toggle("on", keys.some((k) => held.has(k)));
+  setTimeout(loop, CFG.send_ms);
+}
+loop();
+</script>
+</body>
+</html>
